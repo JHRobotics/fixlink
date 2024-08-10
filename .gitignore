@@ -1,0 +1,10 @@
+#backup
+/test/
+
+*.exe
+*.bat
+*.bak
+*.backup
+*.obj
+*.o
+
