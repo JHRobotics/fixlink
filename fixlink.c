@@ -566,8 +566,8 @@ int fix_pe_shared(const char *file, bool dofix)
 													memcpy(section_name, section.Name, 8);
 													printf("Section: %8s, flags = %08X", section_name, section.Characteristics);
 													
-													if(((section.Characteristics & IMAGE_SCN_MEM_SHARED) == 0) &&
-														((section.Characteristics & IMAGE_SCN_MEM_DISCARDABLE) == 0))
+													if(((section.Characteristics & IMAGE_SCN_MEM_SHARED) == 0)
+														 /* && ((section.Characteristics & IMAGE_SCN_MEM_DISCARDABLE) == 0)*/)
 													{
 														if(dofix)
 														{
