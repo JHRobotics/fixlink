@@ -37,12 +37,16 @@ cl /nologo /MT fixlink.c /link /out:fixlink.exe
 ## Usage
 
 ```
-Usage: fixlink <mode> [--dry-run] exe_file_to_fix
+fixlink <mode> [--dry-run] exe_file_to_fix
 <mode> can be:
 -40: set expect Windows version to 4.0 (NE target)
 -vxd32: fix wrong paging and flags in wlink VXD (LE target)
 -shared: fix EXE/DLL to load to shared memory (PE target)
 -checksum: recalculate PE checksum (PE target)
+-relink: replace import DLL with another one, usage is:
+        -relink tofix.exe newDLL.dll oldDLL.dll [another_old_DLL.dll [...]]
+-hint: update import ordinals to match export library, usage is:
+        -hint [--dry-run] [--use-export-name] tofix.exe import.dll
 ```
 
 
@@ -52,3 +56,8 @@ Mode `-vxd32` fixing bad segmentation in Windows 32-bit VXD created by Watcom li
 
 Mode `-shared` simulate missing MS `link.exe` `/shared` option in GNU LD and others modern linkers (please don't confuse with GCC/LD `-shared` option to produce DLL/SO files). Target executable must have image base above 2GB (`0x80000000`) to make this option works. Required for DirectDraw driver development.
 
+Mode `-checksum` recalculate and update PE checksum, very useful on manual edit of binary file.
+
+Mode `-relink` allow to replace import library (1 or more) to another one. Useful when you want rename import library name or you want insert wrapper library between program EXE/DLL and system DLL. Program only rename entry in import table and doesn't check if library exists or it is usable. Please also note, that new library needs provide all import symbols like original(s).
+
+Mode `-hint` update ordinal number to match export library for program faster start. Next useful usage is check when export library provides all symbol to import library (use with `--dry-run` if you don't want to change original file). When `--use-export-name` program compare export library name from export table not from file name.

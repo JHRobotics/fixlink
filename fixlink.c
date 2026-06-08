@@ -1,7 +1,7 @@
 /*****************************************************************************
  MIT No Attribution
 
- Copyright 2023-2024 Jaroslav Hensl <emulator@emulace.cz>
+ Copyright 2023-2026 Jaroslav Hensl <emulator@emulace.cz>
 
  Permission is hereby granted, free of charge, to any person obtaining a copy
  of this software and associated documentation files (the "Software"), to deal
@@ -32,6 +32,10 @@ const char help[] =
 	"-vxd32: fix wrong paging and flags in wlink VXD (LE target)\n"
 	"-shared: fix EXE/DLL to load to shared memory (PE target)\n"
 	"-checksum: recalculate PE checksum (PE target)\n"
+	"-relink: replace import DLL with another one, usage is:\n"
+	"\t-relink tofix.exe newDLL.dll oldDLL.dll [another_old_DLL.dll [...]]\n"
+	"-hint: update import ordinals to match export library, usage is:\n"
+	"\t-hint [--dry-run] [--use-export-name] tofix.exe import.dll\n"
 	"\n";
 
 #pragma pack(push)
@@ -290,6 +294,38 @@ typedef struct PE_section
 #define IMAGE_SCN_MEM_SHARED 0x10000000
 #define IMAGE_SCN_MEM_DISCARDABLE 0x02000000
 
+typedef struct PE_idata_idt
+{
+	uint32_t rva_import_lookup_table;
+	uint32_t timestamp;
+	uint32_t forwarder_chain; 
+	uint32_t rva_dllname;
+	uint32_t rva_import_address_table;
+} PE_idata_idt_t;
+
+#define ILT_IS_ORDINAL 0x80000000
+
+typedef struct PE_hint_name_table
+{
+	uint16_t hint;
+	char name[1]; /* variable length word padded */
+} PE_hint_name_table_t;
+
+typedef struct PE_edata_edt
+{
+	uint32_t flags; /* Reserved, must be 0. */
+	uint32_t timestamp; /* The time and date that the export data was created. */
+	uint16_t major; /* The major version number. The major and minor version numbers can be set by the user. */
+	uint16_t minor; /* The minor version number. */
+	uint32_t rva_dllname; /*	The address of the ASCII string that contains the name of the DLL. This address is relative to the image base. */
+	uint32_t ordinal_base; /* The starting ordinal number for exports in this image. This field specifies the starting ordinal number for the export address table. It is usually set to 1. */
+	uint32_t address_table_entries; /* The number of entries in the export address table. */
+	uint32_t number_of_name_pointers; /* The number of entries in the name pointer table. This is also the number of entries in the ordinal table. */
+	uint32_t rva_export_address_table; /*	The address of the export address table, relative to the image base. */
+	uint32_t rva_name_pointer; /*	The address of the export name pointer table, relative to the image base. The table size is given by the Number of Name Pointers field. */
+	uint32_t rva_ordinal_table; /*	The address of the ordinal table, relative to the image base. */
+} PE_edata_edt_t;
+
 #pragma pack(pop)
 
 /* error codes */
@@ -306,6 +342,11 @@ typedef struct PE_section
 #define ERROR_NOT_PE32  -10
 #define ERROR_NOT_PE_I386 -11
 #define ERROR_NO_FILE -12
+#define ERROR_NO_SECTION -13
+#define ERROR_MALLOC -14
+#define ERROR_TOO_MANY_DLL -15
+#define ERROR_NEED_1_AND_MORE_FILES -16
+#define ERROR_NEED_2_AND_MORE_FILES -16
 
 typedef struct error_msg
 {
@@ -326,6 +367,11 @@ error_msg_t error_msg_table[] = {
 	{ERROR_NOT_PE32, "Wrong PE version, PE32 required!"},
 	{ERROR_NOT_PE_I386, "EXE file architecture in not i386!"},
 	{ERROR_NO_FILE, "No file specified"},
+	{ERROR_NO_SECTION, "section not found in PE file!"},
+	{ERROR_MALLOC, "cannot allocate memory"},
+	{ERROR_TOO_MANY_DLL, "To much DLL on command line"},
+	{ERROR_NEED_1_AND_MORE_FILES, "This command need additional 1 file"},
+	{ERROR_NEED_1_AND_MORE_FILES, "This command need additional 2 or more files"},
 	{0, NULL}
 };
 
@@ -402,6 +448,17 @@ bool writeback_block(FILE *f, size_t block_size, void *data)
 	fseek(f, offset, SEEK_SET);
 
 	return false;
+}
+
+void sstrcpy(void *dst, const void *src, size_t buffer_max)
+{
+	size_t len = strlen(src);
+	if((len+1) > buffer_max)
+	{
+		len = buffer_max-1;
+	}
+	memcpy(dst, src, len);
+	((uint8_t*)dst)[len] = '\0';
 }
 
 int fix_wlink_vxd(const char *file, bool dofix)
@@ -597,6 +654,8 @@ int fix_pe_shared(const char *file, bool dofix)
 				} else rc = ERROR_NOT_PE;
 			} else rc = ERROR_READ;
 		} else rc = ERROR_NOT_MZ;
+
+		fclose(f);
 	} else rc = ERROR_OPEN;
 	
 	return rc;
@@ -713,17 +772,560 @@ int fix_pe_checksum(const char *file, bool dofix)
 				} else rc = ERROR_NOT_PE;
 			} else rc = ERROR_READ;
 		} else rc = ERROR_NOT_NE;
+
 		fclose(f);
 	} else rc = ERROR_OPEN;
 		
 	return rc;
 }
 
+typedef bool (*section_modif_callback_t)(PE_section_t *section, void *section_data, void *clb_data);
+
+int pe_modify_section(const char *file, const char *name, section_modif_callback_t clb, void *clb_data)
+{
+	EXE_header_t exe;
+	PE_signature_t pe_sign;
+	COFF_header_t coff;
+	PE_header_t pe;
+	PE_section_t section;
+	char section_name[9] = {0};
+	
+	FILE *f;
+	int rc = ERROR_NO_SECTION;
+	long offset;
+	
+	f = fopen(file, "r+b");
+	if(f != NULL)
+	{
+		offset = EXE_offset(f, &exe);
+		if(offset > 0)
+		{
+			if(read_move(f, offset))
+			{
+				if(read_header(f, sizeof(PE_signature_t), PE_SIGN, &pe_sign))
+				{
+					if(pe_sign.zero == 0)
+					{
+						if(read_block(f, sizeof(COFF_header_t), &coff))
+						{
+							if(coff.Machine == IMAGE_FILE_MACHINE_I386)
+							{
+								if(read_header(f, sizeof(PE_header_t), PE32, &pe))
+								{
+									/* skip extra space which not in PE_header_t */
+									if(fseek(f, SIZE_OF_PE32-sizeof(PE_header_t), SEEK_CUR) == 0)
+									{
+										unsigned int i;
+										for(i = 0; i < coff.NumberOfSections; i++)
+										{
+											if(read_block(f, sizeof(PE_section_t), &section))
+											{
+												memcpy(section_name, section.Name, 8);
+												if(stricmp(section_name, name) == 0)
+												{
+													void *ptr = malloc(section.VirtualSize);
+													
+													if(ptr != NULL)
+													{
+														int block_read_size;
+														memset(ptr, 0, section.VirtualSize);
+														block_read_size = section.SizeOfRawData;
+														if((uint32_t)block_read_size > section.VirtualSize)
+														{
+															block_read_size = section.VirtualSize;
+														}
+														
+														read_block_begin(f, section.PointerToRawData, block_read_size, ptr);
+														if(clb(&section, ptr, clb_data))
+														{
+															writeback_block(f, block_read_size, ptr);
+														}
+														free(ptr);
+														rc = OK;
+														break;
+													} else rc = ERROR_MALLOC;
+												} /* section_name == name */
+											} else rc = ERROR_READ;
+										} /* for */
+									} else rc = ERROR_READ;
+								} else rc = ERROR_NOT_PE32;
+							} else rc = ERROR_NOT_PE_I386;
+						} else rc = ERROR_READ;
+					} else rc = ERROR_NOT_PE;
+				} else rc = ERROR_NOT_PE;
+			} else rc = ERROR_READ;
+		} else rc = ERROR_NOT_MZ;
+
+		fclose(f);
+	} else rc = ERROR_OPEN;
+	
+	return rc;
+}
+
+void *rva_to_ptr(uint32_t rva, PE_section_t *s, void *mem)
+{
+	uint32_t offset = rva - s->VirtualAddress;
+	
+	if(rva == 0) return NULL;
+	if(offset >= s->VirtualSize) return NULL;
+	
+	return (((uint8_t*)mem) + offset);
+}
+
+uint32_t rva_to_off(uint32_t rva, PE_section_t *s)
+{
+	return rva - s->VirtualAddress;
+}
+
+uint32_t rva_from_ptr(void *ptr, PE_section_t *s, void *mem)
+{
+	return (((uint8_t*)ptr) - ((uint8_t*)mem)) + s->VirtualAddress;
+}
+
+size_t hnt_len(PE_hint_name_table_t *hnt)
+{
+	uint16_t *dst = (uint16_t *)hnt;
+	size_t len = 2;
+	do
+	{
+		dst++;
+		len += 2;
+	} while(
+		((*dst) & 0x00FF) != 0 &&
+		((*dst) & 0xFF00) != 0
+	);
+	
+	return len;
+}
+
+uint8_t *found_space(size_t size, uint8_t *mem, size_t mem_size)
+{
+	uint8_t *ptr = mem;
+	uint8_t *ptr_max = mem + (mem_size - size);
+	
+	while(ptr <= ptr_max)
+	{
+		int k;
+		for(k = size - 1; k >= 0; k--)
+		{
+			if(ptr[k] != 0)
+			{
+				ptr += k+1;
+				break;
+			}
+		}
+		if(k < 0) return ptr;
+	}
+	return NULL;
+}
+
+#define MAX_REPLACE_DLLS 16
+#define MAX_DLL_NAME 128
+#define MAX_SYM_NAME 256
+
+struct ht;
+typedef struct args_dll_item
+{
+	const char *filename;
+	char base[MAX_DLL_NAME];
+	PE_idata_idt_t *idt;
+	struct ht *ht;
+	bool use_export_name;
+	bool found;
+} args_dll_item_t;
+
+typedef struct args_dll
+{
+	int cnt;
+	bool dofix;
+	args_dll_item_t items[MAX_REPLACE_DLLS];
+} args_dll_t;
+
+static void filename2base(const char *fn, char *base)
+{
+	const char *pos_slash = strrchr(fn, '/');
+	const char *pos_backslash = strrchr(fn, '/');
+	const char *pos_sep = NULL;
+	if(pos_slash != NULL && pos_backslash != NULL)
+	{
+		if(pos_slash > pos_backslash)
+			pos_sep = pos_slash;
+		else
+			pos_sep = pos_backslash;
+	}
+	else if(pos_slash != NULL)
+		pos_sep = pos_slash;
+	else if(pos_backslash != NULL)
+		pos_sep = pos_backslash;
+	
+	if(pos_sep)
+	{
+		if(strlen(pos_sep+1) > 0)
+		{
+			sstrcpy(base, pos_sep+1, MAX_DLL_NAME);
+			return;
+		}
+	}
+	
+	sstrcpy(base, fn, MAX_DLL_NAME);
+}
+
+/*
+	https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#the-idata-section
+	PointerToRawData = file offset
+	RVA - virtal address = offset to PointerToRawData
+	
+	[directory - 5 dwords:
+		RVA import lookup table
+		0
+		0
+		RVA dll name
+		RVA import address table 
+	]
+*/
+
+bool pe_relink_section(PE_section_t *section, void *section_data, void *clb_data)
+{
+	PE_idata_idt_t *idt = section_data;
+	args_dll_t *args = clb_data;
+	uint8_t *free_mem = malloc(section->VirtualSize);
+	int dirs = 0;
+	int i;
+	uint8_t *new_pos;
+	size_t new_size;
+	bool rc = false;
+	uint32_t min_rva = -1;
+
+	if(free_mem != NULL)
+	{
+		memset(free_mem, 0, section->VirtualSize);
+		do
+		{
+			if(idt->rva_import_lookup_table != 0)
+			{
+				char *name = rva_to_ptr(idt->rva_dllname, section, section_data);
+				uint32_t *ilt = rva_to_ptr(idt->rva_import_lookup_table, section, section_data);
+				size_t itl_len = 0;
+				
+				if(name != NULL)
+				{
+					for(i = 1; i < args->cnt; i++)
+					{
+						if(stricmp(name, args->items[i].base) == 0)
+						{
+							args->items[i].idt = idt;
+							/*printf("found %s\n", rep->dlls[i]);*/
+							if(idt->rva_dllname < min_rva)
+							{
+								min_rva = idt->rva_dllname;
+							}
+						}
+					}
+					
+					while(*ilt != 0)
+					{
+						if(((*ilt) & ILT_IS_ORDINAL) == 0)
+						{
+							size_t hlen;
+							PE_hint_name_table_t *hnt = rva_to_ptr(*ilt, section, section_data);
+							if(hnt != NULL)
+							{
+								hlen = hnt_len(hnt);
+								memset(rva_to_ptr(*ilt, section, free_mem), 0xFF, hlen);
+							}
+						}
+						else
+						{
+							/* warn ordinal */
+						}
+						
+						ilt++;
+						itl_len++;
+					}
+					itl_len++;
+					
+					memset(
+						rva_to_ptr(idt->rva_import_lookup_table, section, free_mem),
+						0xFF, sizeof(PE_idata_idt_t));
+					
+					memset(
+						rva_to_ptr(idt->rva_import_address_table, section, free_mem),
+						0xFF, sizeof(PE_idata_idt_t));
+						
+					memset(
+						rva_to_ptr(idt->rva_dllname, section, free_mem),
+						0xFF, strlen(name)+1);
+				} /* name != NULL */
+			}
+			memset(free_mem + dirs*sizeof(PE_idata_idt_t), 0xFF, sizeof(uint32_t));
+			idt++;
+			dirs++;
+		} while(idt->rva_import_lookup_table != 0);
+		
+		memset(free_mem, 0xFF, dirs * sizeof(PE_idata_idt_t));
+		
+		/* clear space with dll name as clean */
+		for(i = 1; i < args->cnt; i++)
+		{
+			if(args->items[i].idt != NULL)
+			{
+				memset(
+					rva_to_ptr(args->items[i].idt->rva_dllname, section, free_mem),
+					0x00, strlen(args->items[i].base)+1);
+				memset(
+					rva_to_ptr(args->items[i].idt->rva_dllname, section, section_data),
+					0x00, strlen(args->items[i].base)+1);
+			}
+			else
+			{
+				fprintf(stderr, "Warn: %s is not in import list\n", args->items[i].base);
+			}
+		}
+		
+		if(min_rva != (uint32_t)(-1))
+		{
+			new_size = strlen(args->items[0].base)+1;
+			new_pos = found_space(new_size, free_mem+rva_to_off(min_rva, section), section->VirtualSize-rva_to_off(min_rva, section));
+			if(new_pos == NULL)
+			{
+				new_pos = found_space(new_size, free_mem, section->VirtualSize);
+			}
+			
+			if(new_pos != NULL)
+			{
+				uint32_t rva = rva_from_ptr(new_pos, section, free_mem);
+				uint8_t *new_pos_sec = rva_to_ptr(rva, section, section_data);
+				
+				memcpy(new_pos_sec, args->items[0].base, new_size);
+				rc = true;
+				
+				for(i = 1; i < args->cnt; i++)
+				{
+					if(args->items[i].idt != NULL)
+					{
+						printf("replaced %s (filename rva 0x%X) -> %s (filename rva 0x%X)\n",
+							args->items[i].base, args->items[i].idt->rva_dllname,
+							args->items[0].base, rva);
+						args->items[i].idt->rva_dllname = rva;
+					}
+				}
+			}
+			else
+			{
+				fprintf(stderr, "Error: Can't find empty space of %d bytes in .idata\n", new_size);
+			}
+		}
+		else
+		{
+			fprintf(stderr, "Warn: cannot find any library to replace\n");
+		}
+		
+		free(free_mem);
+	}
+	
+	if(!args->dofix) return false;
+	
+	return rc;
+}
+
+#define HT_PRIME 113
+
+typedef struct ht_symbol
+{
+	char name[MAX_SYM_NAME];
+	uint16_t ordinal;
+	struct ht_symbol *next;
+} ht_symbol_t;
+
+
+typedef struct ht
+{
+	ht_symbol_t *items[HT_PRIME];
+} ht_t;
+
+/**
+ * Based on djb2 function (http://www.cse.yorku.ca/~oz/hash.html).
+ */
+uint32_t ht_hash(const char *str)
+{
+	uint32_t hash = 5381;
+	while(*str != '\0')
+	{
+		hash = ((hash << 5) + hash) + (*str); /* hash * 33 + c */
+		str++;
+	}
+	
+	return hash % HT_PRIME;
+}
+
+bool ht_insert(ht_t *ht, const char *name, uint32_t ordinal)
+{
+	ht_symbol_t **sym;
+	ht_symbol_t *item;
+	uint32_t hash = ht_hash(name);
+	
+	sym = &(ht->items[hash]);
+	while(*sym != NULL)
+	{
+		if(stricmp(name, (*sym)->name) == 0)
+		{
+			printf("Warn: symbol %s exists - ordinal %u vs %u", name, (*sym)->ordinal, ordinal);
+		}
+		sym = &((*sym)->next);
+	}
+	item = malloc(sizeof(ht_symbol_t));
+	if(item)
+	{
+		sstrcpy(item->name, name, MAX_SYM_NAME);
+		item->ordinal = ordinal;
+		item->next = NULL;
+		*sym = item;
+		return true;
+	}
+	return false;
+}
+
+bool ht_lookup(ht_t *ht, const char *name, uint32_t *ordinal)
+{
+	ht_symbol_t *sym = ht->items[ht_hash(name)];
+	
+	while(sym != NULL)
+	{
+		if(stricmp(name, sym->name) == 0)
+		{
+			if(ordinal != NULL)
+			{
+				*ordinal = sym->ordinal;
+			}
+			return true;
+		}
+		sym = sym->next;
+	}
+	return false;
+}
+
+ht_t *ht_create()
+{
+	ht_t *ht = malloc(sizeof(ht_t));
+	
+	if(ht)
+	{
+		memset(ht, 0, sizeof(ht_t));
+	}
+	
+	return ht;
+}
+
+void ht_destroy(ht_t **ht)
+{
+	int i;
+	
+	if(*ht == NULL) return;
+	
+	for(i = 0; i < HT_PRIME; i++)
+	{
+		ht_symbol_t *sym = (*ht)->items[i];
+		while(sym != NULL)
+		{
+			ht_symbol_t *garbage = sym;
+			sym = sym->next;
+			
+			free(garbage);
+		}
+		(*ht)->items[i] = NULL;
+	}
+	
+	free(*ht);
+	
+	*ht = NULL;
+}
+
+bool pe_hint_export(PE_section_t *section, void *section_data, void *clb_data)
+{
+	uint32_t y;
+	args_dll_item_t *item = clb_data;
+	PE_edata_edt_t *edt = section_data;
+	const char *name = rva_to_ptr(edt->rva_dllname, section, section_data);
+	uint32_t *name_table = rva_to_ptr(edt->rva_name_pointer, section, section_data);
+	uint16_t *ordinal_table = rva_to_ptr(edt->rva_ordinal_table, section, section_data);
+	
+	if(name != NULL && item->use_export_name)
+	{
+		/* printf("export: %s\n", name); */
+		sstrcpy(item->base, name, MAX_DLL_NAME);
+	}
+	
+	if(edt->number_of_name_pointers && name_table != NULL && ordinal_table != NULL)
+	{
+		for(y = 0; y < edt->number_of_name_pointers; y++)
+		{
+			const char *export_name = rva_to_ptr(name_table[y], section, section_data);
+			if(export_name)
+			{
+				/*printf("%d\t%s\n", ordinal_table[y]+edt->ordinal_base, export_name);*/
+				ht_insert(item->ht, export_name, ordinal_table[y]+edt->ordinal_base);
+			}
+		}
+	}
+	return false;
+}
+
+bool pe_hint_import(PE_section_t *section, void *section_data, void *clb_data)
+{
+	PE_idata_idt_t *idt = section_data;
+	args_dll_t *args = clb_data;
+	
+	while(idt->rva_import_lookup_table != 0)
+	{
+		char *name = rva_to_ptr(idt->rva_dllname, section, section_data);
+		uint32_t *ilt = rva_to_ptr(idt->rva_import_lookup_table, section, section_data);
+
+		if(name != NULL)
+		{
+			int i;
+			for(i = 0; i < args->cnt; i++)
+			{
+				/*printf("check: %s == %s\n", name, args->items[i].base);*/
+				if(stricmp(name, args->items[i].base) == 0)
+				{
+					while(*ilt != 0)
+					{
+						if(((*ilt) & ILT_IS_ORDINAL) == 0)
+						{
+							PE_hint_name_table_t *hnt = rva_to_ptr(*ilt, section, section_data);
+							if(hnt != NULL)
+							{
+								uint32_t ord;
+								if(ht_lookup(args->items[i].ht, hnt->name, &ord))
+								{
+									hnt->hint = ord;
+								}
+								else
+								{
+									fprintf(stderr, "Warn: export %s not found in %s\n", hnt->name, args->items[i].base);
+								}
+							}
+						}
+						ilt++;
+					}
+					args->items[i].found = true;
+				}
+			}
+		}
+		idt++;
+	}
+	
+	return false;
+}
+
+
 #define MODE_UNSET 0
 #define MODE_40 1
 #define MODE_VXD32 2
 #define MODE_SHARED 3
 #define MODE_CHECKSUM 4
+#define MODE_RELINK 5
+#define MODE_HINT 6
 
 #define CMP(_s) (stricmp(argv[i], _s) == 0)
 
@@ -731,15 +1333,19 @@ int main(int argc, char *argv[])
 {
 	const char *filename = NULL;
 	bool dofix = true;
+	bool use_export_name = false;
 	int mode = MODE_UNSET;
 	int i;
 	int rc = OK;
 	error_msg_t *err_msg;
+	static args_dll_t dlltable = {0};
 	
 	for(i = 1; i < argc; i++)
 	{
 		if(CMP("--dry-run"))
 			dofix = false;
+		else if(CMP("--use-export-name"))
+			use_export_name = true;
 		else if(CMP("-40"))
 			mode = MODE_40;
 		else if(CMP("-vxd32"))
@@ -748,8 +1354,26 @@ int main(int argc, char *argv[])
 			mode = MODE_SHARED;
 		else if(CMP("-checksum"))
 			mode = MODE_CHECKSUM;
+		else if(CMP("-relink"))
+			mode = MODE_RELINK;
+		else if(CMP("-hint"))
+			mode = MODE_HINT;
 		else
-			filename = argv[i];
+		{
+			if(filename == NULL)
+			{
+				filename = argv[i];
+			}
+			else
+			{
+				if(dlltable.cnt < MAX_REPLACE_DLLS)
+				{
+					dlltable.items[dlltable.cnt].filename = argv[i];
+					filename2base(argv[i], dlltable.items[dlltable.cnt].base);
+				}
+				dlltable.cnt++;
+			}
+		}
 	}
 	
 	if(mode != MODE_UNSET && filename == NULL)
@@ -776,11 +1400,61 @@ int main(int argc, char *argv[])
 			case MODE_CHECKSUM:
 				rc = fix_pe_checksum(filename, dofix);
 				break;
+			case MODE_RELINK:
+				if(dlltable.cnt >= 2)
+				{
+					dlltable.dofix = dofix;
+					if(dlltable.cnt <= MAX_REPLACE_DLLS)
+					{
+						dlltable.dofix = dofix;
+						rc = pe_modify_section(filename, ".idata", pe_relink_section, &dlltable);
+						if(rc == OK && dofix)
+						{
+							rc = fix_pe_checksum(filename, true);
+						}
+					} else rc = ERROR_TOO_MANY_DLL;
+				} else rc = ERROR_NEED_2_AND_MORE_FILES;
+				break;
+			case MODE_HINT:
+				if(dlltable.cnt >= 1)
+				{
+					int x, rc2;
+					dlltable.dofix = dofix;
+					for(x = 0; x < dlltable.cnt; x++)
+					{
+						dlltable.items[x].ht = ht_create();
+						dlltable.items[x].use_export_name = use_export_name;
+						
+						if(dlltable.items[x].ht != NULL)
+						{
+							rc2 = pe_modify_section(dlltable.items[x].filename, ".edata", pe_hint_export, &dlltable.items[x]);
+							if(rc2 != OK)
+							{
+								fprintf(stderr, "Warn: cannot extract symbols from %s\n", dlltable.items[x].filename);
+							}
+						}
+					}
+					rc = pe_modify_section(filename, ".idata", pe_hint_import, &dlltable);
+					
+					for(x = 0; x < dlltable.cnt; x++)
+					{
+						ht_destroy(&(dlltable.items[x].ht));
+						if(!dlltable.items[x].found)
+						{
+							fprintf(stderr, "Warn: DLL %s (%s) is not imported\n", dlltable.items[x].filename, dlltable.items[x].base);
+						}
+					}
+					
+					if(dofix) fix_pe_checksum(filename, true);
+				} else rc = ERROR_NEED_1_AND_MORE_FILES;
+				break;
 			default:
 				printf(help, argv[0]);
 				break;
 		}
 	}
+	
+	/* fprintf(stderr, "rc=%d\n", rc); */
 	
 	if(rc == OK)
 		return EXIT_SUCCESS;
@@ -790,7 +1464,13 @@ int main(int argc, char *argv[])
 		if(rc == err_msg->code)
 		{
 			fprintf(stderr, "Error: %s\n", err_msg->txt);
+			break;
 		}
+	}
+	
+	if(err_msg->txt == NULL)
+	{
+		fprintf(stderr, "Error: code %d\n", rc);
 	}
 	
 	return EXIT_FAILURE;

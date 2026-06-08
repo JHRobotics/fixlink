@@ -1,5 +1,6 @@
 #backup
 /test/
+/gltest/
 
 *.exe
 *.bat
