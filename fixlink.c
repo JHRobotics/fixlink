@@ -868,13 +868,13 @@ int pe_modify_section(const char *file, const char *name, int type, section_modi
 									size_t dir_size = sizeof(PE_image_directory_t) * pe.NumberOfRvaAndSizes;
 									if(read_block(f, dir_size, &image_dir))
 									{
+										unsigned int i;
 										/* skip extra space which not in PE_header_t */
 										if(sizeof(PE_header_t)+dir_size < SIZE_OF_PE32)
 										{
 											fseek(f, SIZE_OF_PE32-(sizeof(PE_header_t)+dir_size), SEEK_CUR);
 										}
 										
-										unsigned int i;
 										for(i = 0; i < coff.NumberOfSections; i++)
 										{
 											if(read_block(f, sizeof(PE_section_t), &section))
