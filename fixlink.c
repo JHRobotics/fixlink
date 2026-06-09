@@ -294,6 +294,39 @@ typedef struct PE_section
 #define IMAGE_SCN_MEM_SHARED 0x10000000
 #define IMAGE_SCN_MEM_DISCARDABLE 0x02000000
 
+typedef struct PE_image_directory
+{
+	uint32_t VirtualAddress;
+	uint32_t Size;
+} PE_image_directory_t;
+
+typedef struct PE_image_directories
+{
+	PE_image_directory_t ExportTable;
+	PE_image_directory_t ImportTable;
+	PE_image_directory_t ResourceTable;
+	PE_image_directory_t ExceptionTable;
+	PE_image_directory_t CertificateTable;
+	PE_image_directory_t BaseRelocationTable;
+	PE_image_directory_t Debug;
+	PE_image_directory_t Architecture;
+	PE_image_directory_t GlobalPtr;
+	PE_image_directory_t TLSTable;
+	PE_image_directory_t LoadConfigTable;
+	PE_image_directory_t BoundImport;
+	PE_image_directory_t IAT;
+	PE_image_directory_t DelayImportDescriptor;
+	PE_image_directory_t CLRRuntimeHeader;
+	PE_image_directory_t Reserved;
+} PE_image_directories_t;
+
+#define ID_EXPORT_TABLE 1
+#define ID_IMPORT_TABLE 2
+#define ID_RESOURCE_TABLE 3
+#define ID_EXCEPTION_TABLE 4
+#define ID_CERTIFICATE_TABLE 5
+#define ID_BASE_RELOCATION_TABLE 6
+
 typedef struct PE_idata_idt
 {
 	uint32_t rva_import_lookup_table;
@@ -779,9 +812,26 @@ int fix_pe_checksum(const char *file, bool dofix)
 	return rc;
 }
 
-typedef bool (*section_modif_callback_t)(PE_section_t *section, void *section_data, void *clb_data);
+static bool in_section(PE_section_t *section, uint32_t rva, uint32_t *offset)
+{
+	if(rva >= section->VirtualAddress)
+	{
+		if(rva < (section->VirtualAddress+section->VirtualSize))
+		{
+			if(offset != NULL)
+			{
+				*offset = rva - section->VirtualAddress;
+			}
+			
+			return true;
+		}
+	}
+	return false;
+}
 
-int pe_modify_section(const char *file, const char *name, section_modif_callback_t clb, void *clb_data)
+typedef bool (*section_modif_callback_t)(PE_section_t *section, void *section_data, void *clb_data, uint32_t offset);
+
+int pe_modify_section(const char *file, const char *name, int type, section_modif_callback_t clb, void *clb_data)
 {
 	EXE_header_t exe;
 	PE_signature_t pe_sign;
@@ -789,10 +839,13 @@ int pe_modify_section(const char *file, const char *name, section_modif_callback
 	PE_header_t pe;
 	PE_section_t section;
 	char section_name[9] = {0};
+	PE_image_directories_t image_dir;
 	
 	FILE *f;
 	int rc = ERROR_NO_SECTION;
 	long offset;
+	
+	memset(&image_dir, 0, sizeof(PE_image_directories_t));
 	
 	f = fopen(file, "r+b");
 	if(f != NULL)
@@ -812,18 +865,57 @@ int pe_modify_section(const char *file, const char *name, section_modif_callback
 							{
 								if(read_header(f, sizeof(PE_header_t), PE32, &pe))
 								{
-									/* skip extra space which not in PE_header_t */
-									if(fseek(f, SIZE_OF_PE32-sizeof(PE_header_t), SEEK_CUR) == 0)
+									size_t dir_size = sizeof(PE_image_directory_t) * pe.NumberOfRvaAndSizes;
+									if(read_block(f, dir_size, &image_dir))
 									{
+										/* skip extra space which not in PE_header_t */
+										if(sizeof(PE_header_t)+dir_size < SIZE_OF_PE32)
+										{
+											fseek(f, SIZE_OF_PE32-(sizeof(PE_header_t)+dir_size), SEEK_CUR);
+										}
+										
 										unsigned int i;
 										for(i = 0; i < coff.NumberOfSections; i++)
 										{
 											if(read_block(f, sizeof(PE_section_t), &section))
 											{
+												bool match = false;
+												uint32_t data_offset = 0;
 												memcpy(section_name, section.Name, 8);
-												if(stricmp(section_name, name) == 0)
+												/*printf("section: %s %X %X\n", section_name, section.VirtualAddress, image_dir.ExportTable.VirtualAddress);*/
+												if(name != NULL)
+												{
+													match = (stricmp(section_name, name) == 0);
+												}
+												else
+												{
+													switch(type)
+													{
+														case ID_EXPORT_TABLE:
+															match = in_section(&section, image_dir.ExportTable.VirtualAddress, &data_offset);
+															break;
+														case ID_IMPORT_TABLE:
+															match = in_section(&section, image_dir.ImportTable.VirtualAddress, &data_offset);
+															break;
+														case ID_RESOURCE_TABLE:
+															match = in_section(&section, image_dir.ResourceTable.VirtualAddress, &data_offset);
+															break;
+														case ID_EXCEPTION_TABLE:
+															match = in_section(&section, image_dir.ExceptionTable.VirtualAddress, &data_offset);
+															break;
+														case ID_CERTIFICATE_TABLE:
+															match = in_section(&section, image_dir.CertificateTable.VirtualAddress, &data_offset);
+															break;
+														case ID_BASE_RELOCATION_TABLE:
+															match = in_section(&section, image_dir.BaseRelocationTable.VirtualAddress, &data_offset);
+															break;
+													}
+												}
+
+												if(match)
 												{
 													void *ptr = malloc(section.VirtualSize);
+													/*printf("match: %d\n", data_offset);*/
 													
 													if(ptr != NULL)
 													{
@@ -836,7 +928,7 @@ int pe_modify_section(const char *file, const char *name, section_modif_callback
 														}
 														
 														read_block_begin(f, section.PointerToRawData, block_read_size, ptr);
-														if(clb(&section, ptr, clb_data))
+														if(clb(&section, ptr, clb_data, data_offset))
 														{
 															writeback_block(f, block_read_size, ptr);
 														}
@@ -944,7 +1036,7 @@ typedef struct args_dll
 static void filename2base(const char *fn, char *base)
 {
 	const char *pos_slash = strrchr(fn, '/');
-	const char *pos_backslash = strrchr(fn, '/');
+	const char *pos_backslash = strrchr(fn, '\\');
 	const char *pos_sep = NULL;
 	if(pos_slash != NULL && pos_backslash != NULL)
 	{
@@ -984,9 +1076,9 @@ static void filename2base(const char *fn, char *base)
 	]
 */
 
-bool pe_relink_section(PE_section_t *section, void *section_data, void *clb_data)
+bool pe_relink_section(PE_section_t *section, void *section_data, void *clb_data, uint32_t data_offset)
 {
-	PE_idata_idt_t *idt = section_data;
+	PE_idata_idt_t *idt = (PE_idata_idt_t*)(((uint8_t*)section_data)+data_offset);
 	args_dll_t *args = clb_data;
 	uint8_t *free_mem = malloc(section->VirtualSize);
 	int dirs = 0;
@@ -1057,7 +1149,7 @@ bool pe_relink_section(PE_section_t *section, void *section_data, void *clb_data
 						0xFF, strlen(name)+1);
 				} /* name != NULL */
 			}
-			memset(free_mem + dirs*sizeof(PE_idata_idt_t), 0xFF, sizeof(uint32_t));
+			memset(free_mem + data_offset + dirs*sizeof(PE_idata_idt_t), 0xFF, sizeof(uint32_t));
 			idt++;
 			dirs++;
 		} while(idt->rva_import_lookup_table != 0);
@@ -1240,18 +1332,18 @@ void ht_destroy(ht_t **ht)
 	*ht = NULL;
 }
 
-bool pe_hint_export(PE_section_t *section, void *section_data, void *clb_data)
+bool pe_hint_export(PE_section_t *section, void *section_data, void *clb_data, uint32_t data_offset)
 {
 	uint32_t y;
 	args_dll_item_t *item = clb_data;
-	PE_edata_edt_t *edt = section_data;
+	PE_edata_edt_t *edt = (PE_edata_edt_t*)(((uint8_t*)section_data) + data_offset);
 	const char *name = rva_to_ptr(edt->rva_dllname, section, section_data);
 	uint32_t *name_table = rva_to_ptr(edt->rva_name_pointer, section, section_data);
 	uint16_t *ordinal_table = rva_to_ptr(edt->rva_ordinal_table, section, section_data);
 	
 	if(name != NULL && item->use_export_name)
 	{
-		/* printf("export: %s\n", name); */
+		/*printf("export: %s\n", name);*/
 		sstrcpy(item->base, name, MAX_DLL_NAME);
 	}
 	
@@ -1270,10 +1362,11 @@ bool pe_hint_export(PE_section_t *section, void *section_data, void *clb_data)
 	return false;
 }
 
-bool pe_hint_import(PE_section_t *section, void *section_data, void *clb_data)
+bool pe_hint_import(PE_section_t *section, void *section_data, void *clb_data, uint32_t data_offset)
 {
-	PE_idata_idt_t *idt = section_data;
+	PE_idata_idt_t *idt = (PE_idata_idt_t*)(((uint8_t*)section_data) + data_offset);
 	args_dll_t *args = clb_data;
+	int updates = 0;
 	
 	while(idt->rva_import_lookup_table != 0)
 	{
@@ -1298,7 +1391,12 @@ bool pe_hint_import(PE_section_t *section, void *section_data, void *clb_data)
 								uint32_t ord;
 								if(ht_lookup(args->items[i].ht, hnt->name, &ord))
 								{
-									hnt->hint = ord;
+									if(hnt->hint != ord)
+									{
+										/*printf("updating: %s - %d -> %d\n", hnt->name, hnt->hint, ord);*/
+										updates++;
+										hnt->hint = ord;
+									}
 								}
 								else
 								{
@@ -1313,6 +1411,11 @@ bool pe_hint_import(PE_section_t *section, void *section_data, void *clb_data)
 			}
 		}
 		idt++;
+	}
+	
+	if(updates > 0 && args->dofix)
+	{
+		return true;
 	}
 	
 	return false;
@@ -1407,7 +1510,7 @@ int main(int argc, char *argv[])
 					if(dlltable.cnt <= MAX_REPLACE_DLLS)
 					{
 						dlltable.dofix = dofix;
-						rc = pe_modify_section(filename, ".idata", pe_relink_section, &dlltable);
+						rc = pe_modify_section(filename, NULL, ID_IMPORT_TABLE, pe_relink_section, &dlltable);
 						if(rc == OK && dofix)
 						{
 							rc = fix_pe_checksum(filename, true);
@@ -1427,14 +1530,14 @@ int main(int argc, char *argv[])
 						
 						if(dlltable.items[x].ht != NULL)
 						{
-							rc2 = pe_modify_section(dlltable.items[x].filename, ".edata", pe_hint_export, &dlltable.items[x]);
+							rc2 = pe_modify_section(dlltable.items[x].filename, NULL, ID_EXPORT_TABLE, pe_hint_export, &dlltable.items[x]);
 							if(rc2 != OK)
 							{
-								fprintf(stderr, "Warn: cannot extract symbols from %s\n", dlltable.items[x].filename);
+								fprintf(stderr, "Warn: cannot extract symbols from %s (rc=%d)\n", dlltable.items[x].filename, rc2);
 							}
 						}
 					}
-					rc = pe_modify_section(filename, ".idata", pe_hint_import, &dlltable);
+					rc = pe_modify_section(filename, NULL, ID_IMPORT_TABLE, pe_hint_import, &dlltable);
 					
 					for(x = 0; x < dlltable.cnt; x++)
 					{
