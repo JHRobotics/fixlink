@@ -41,6 +41,12 @@ const char help[] =
 #pragma pack(push)
 #pragma pack(1)
 
+#ifdef WIN32
+# define strcmp_ci stricmp 
+#else 
+# define strcmp_ci strcasecmp
+#endif
+
 /* http://www.delorie.com/djgpp/doc/exe/ */
 typedef struct EXE_header {
   uint16_t signature; /* == 0x5a4D */
@@ -885,7 +891,7 @@ int pe_modify_section(const char *file, const char *name, int type, section_modi
 												/*printf("section: %s %X %X\n", section_name, section.VirtualAddress, image_dir.ExportTable.VirtualAddress);*/
 												if(name != NULL)
 												{
-													match = (stricmp(section_name, name) == 0);
+													match = (strcmp_ci(section_name, name) == 0);
 												}
 												else
 												{
@@ -1103,7 +1109,7 @@ bool pe_relink_section(PE_section_t *section, void *section_data, void *clb_data
 				{
 					for(i = 1; i < args->cnt; i++)
 					{
-						if(stricmp(name, args->items[i].base) == 0)
+						if(strcmp_ci(name, args->items[i].base) == 0)
 						{
 							args->items[i].idt = idt;
 							/*printf("found %s\n", rep->dlls[i]);*/
@@ -1259,7 +1265,7 @@ bool ht_insert(ht_t *ht, const char *name, uint32_t ordinal)
 	sym = &(ht->items[hash]);
 	while(*sym != NULL)
 	{
-		if(stricmp(name, (*sym)->name) == 0)
+		if(strcmp_ci(name, (*sym)->name) == 0)
 		{
 			printf("Warn: symbol %s exists - ordinal %u vs %u", name, (*sym)->ordinal, ordinal);
 		}
@@ -1283,7 +1289,7 @@ bool ht_lookup(ht_t *ht, const char *name, uint32_t *ordinal)
 	
 	while(sym != NULL)
 	{
-		if(stricmp(name, sym->name) == 0)
+		if(strcmp_ci(name, sym->name) == 0)
 		{
 			if(ordinal != NULL)
 			{
@@ -1379,7 +1385,7 @@ bool pe_hint_import(PE_section_t *section, void *section_data, void *clb_data, u
 			for(i = 0; i < args->cnt; i++)
 			{
 				/*printf("check: %s == %s\n", name, args->items[i].base);*/
-				if(stricmp(name, args->items[i].base) == 0)
+				if(strcmp_ci(name, args->items[i].base) == 0)
 				{
 					while(*ilt != 0)
 					{
@@ -1430,7 +1436,7 @@ bool pe_hint_import(PE_section_t *section, void *section_data, void *clb_data, u
 #define MODE_RELINK 5
 #define MODE_HINT 6
 
-#define CMP(_s) (stricmp(argv[i], _s) == 0)
+#define CMP(_s) (strcmp_ci(argv[i], _s) == 0)
 
 int main(int argc, char *argv[])
 {
